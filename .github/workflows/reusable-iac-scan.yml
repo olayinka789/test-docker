@@ -1,0 +1,136 @@
+name: "Reusable IaC Security Scanning"
+
+on:
+  workflow_call:
+    inputs:
+      iac-path:
+        description: "Path to Infrastructure as Code files (Helm charts, K8s manifests, Terraform)"
+        type: string
+        default: "."
+        required: false
+      framework:
+        description: "Frameworks for Checkov to scan (helm,kubernetes,dockerfile,terraform)"
+        type: string
+        default: "helm,kubernetes,dockerfile"
+        required: false
+      fail-on-findings:
+        description: "Fail the job if security misconfigurations are found"
+        type: boolean
+        default: false
+        required: false
+    secrets:
+      SNYK_TOKEN:
+        required: false
+        description: "Snyk token for IaC testing"
+
+jobs:
+  iac-scan:
+    name: "IaC Security Scanning (Checkov, Terrascan & Trivy Config)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+    steps:
+      - name: "Checkout Code"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python for Checkov"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "Install Checkov & Terrascan"
+        run: |
+          python -m pip install --upgrade pip
+          pip install checkov
+          checkov --version
+
+          TERRASCAN_VERSION="1.19.1"
+          curl -sSL "https://github.com/tenable/terrascan/releases/download/v${TERRASCAN_VERSION}/terrascan_${TERRASCAN_VERSION}_Linux_x86_64.tar.gz" -o terrascan.tar.gz
+          tar -xzf terrascan.tar.gz terrascan
+          sudo mv terrascan /usr/local/bin/
+          terrascan version || true
+
+      - name: "Run Checkov IaC Scanner"
+        id: checkov
+        shell: bash
+        run: |
+          mkdir -p reports
+          EXIT_CODE=0
+          checkov -d "${{ inputs.iac-path }}" \
+            --framework ${{ inputs.framework }} \
+            --output sarif \
+            --output-file-path reports/checkov.sarif || EXIT_CODE=$?
+
+          checkov -d "${{ inputs.iac-path }}" \
+            --framework ${{ inputs.framework }} \
+            --output json \
+            --output-file-path reports/checkov.json || true
+
+          echo "Checkov completed with exit code: $EXIT_CODE"
+          if [ "$EXIT_CODE" -ne 0 ] && [ "${{ inputs.fail-on-findings }}" = "true" ]; then
+            exit $EXIT_CODE
+          fi
+
+      - name: "Run Terrascan IaC Scanner"
+        shell: bash
+        run: |
+          terrascan scan -d "${{ inputs.iac-path }}" -i k8s -o json > reports/terrascan.json || true
+
+      - name: "Run Trivy Config Scanner"
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          scan-type: "config"
+          scan-ref: "${{ inputs.iac-path }}"
+          format: "sarif"
+          output: "reports/trivy-iac.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: "Run Snyk IaC Test (Optional)"
+        if: ${{ env.SNYK_TOKEN != '' }}
+        uses: snyk/actions/iac@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          file: "${{ inputs.iac-path }}"
+          args: --sarif-file-output=reports/snyk-iac.sarif
+
+      - name: "Upload SARIF to GitHub Code Scanning"
+        if: ${{ !cancelled() && hashFiles('reports/checkov.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: reports/checkov.sarif
+          category: checkov-iac-scanning
+
+      - name: "Upload IaC Scan Artifacts"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: iac-scan-reports
+          path: reports/*
+          retention-days: 14
+
+      - name: "Generate Step Summary"
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          echo "### 🏗️ IaC Security Scanning (Checkov, Terrascan, Trivy)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target Directory**: \`${{ inputs.iac-path }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Frameworks**: \`${{ inputs.framework }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f reports/checkov.json ]; then
+            FAILED=$(jq '.summary.failed // 0' reports/checkov.json 2>/dev/null || echo "0")
+            PASSED=$(jq '.summary.passed // 0' reports/checkov.json 2>/dev/null || echo "0")
+            echo "- **Checkov Summary**: Passed=\`$PASSED\`, Failed=\`$FAILED\`" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$FAILED" -gt 0 ]; then
+              echo "⚠️ Security misconfigurations found in Helm / Kubernetes manifests." >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "✅ No IaC misconfigurations detected." >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi

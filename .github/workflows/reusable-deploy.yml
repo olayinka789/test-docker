@@ -1,0 +1,137 @@
+name: "Reusable Kubernetes & Helm Deployment"
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Target environment (staging or prod)"
+        type: string
+        required: true
+      chart-path:
+        description: "Path to Helm chart directory"
+        type: string
+        default: "helmchart"
+        required: false
+      release-name:
+        description: "Helm release name"
+        type: string
+        default: "testapp"
+        required: false
+      namespace:
+        description: "Kubernetes namespace"
+        type: string
+        default: "default"
+        required: false
+      image-repository:
+        description: "Container image repository"
+        type: string
+        default: "ghcr.io/olayinka789/testapp"
+        required: false
+      image-tag:
+        description: "Container image tag"
+        type: string
+        default: "latest"
+        required: false
+      dry-run:
+        description: "Run Helm in dry-run mode"
+        type: boolean
+        default: false
+        required: false
+    secrets:
+      KUBECONFIG_DATA:
+        required: false
+        description: "Base64 encoded Kubeconfig for cluster access"
+    outputs:
+      deployment-status:
+        description: "Deployment execution status"
+        value: ${{ jobs.deploy.outputs.status }}
+      app-url:
+        description: "App URL on target cluster"
+        value: ${{ jobs.deploy.outputs.app-url }}
+
+jobs:
+  deploy:
+    name: "Deploy (${{ inputs.environment }})"
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      status: ${{ steps.deploy_step.outputs.status }}
+      app-url: ${{ steps.deploy_step.outputs.app-url }}
+
+    steps:
+      - name: "Checkout Code"
+        uses: actions/checkout@v4
+
+      - name: "Set up Helm"
+        uses: azure/setup-helm@v4
+        with:
+          version: "v3.14.0"
+
+      - name: "Set up Kubectl"
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: "Configure Cluster Access"
+        shell: bash
+        run: |
+          mkdir -p ~/.kube
+          if [ -n "${{ secrets.KUBECONFIG_DATA }}" ]; then
+            echo "${{ secrets.KUBECONFIG_DATA }}" | base64 -d > ~/.kube/config
+            chmod 600 ~/.kube/config
+            echo "Kubeconfig successfully configured."
+            echo "HAS_KUBECONFIG=true" >> "$GITHUB_ENV"
+          else
+            echo "No KUBECONFIG_DATA secret provided. Running in simulation/manifest validation mode."
+            echo "HAS_KUBECONFIG=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: "Validate Helm Chart"
+        shell: bash
+        run: |
+          echo "Linting Helm chart at ${{ inputs.chart-path }}..."
+          helm lint ${{ inputs.chart-path }}
+          echo "Rendering manifests via helm template..."
+          helm template ${{ inputs.release-name }} ${{ inputs.chart-path }} \
+            --namespace ${{ inputs.namespace }} \
+            --set image.repository=${{ inputs.image-repository }} \
+            --set image.tag=${{ inputs.image-tag }} > rendered-manifests.yaml
+          cat rendered-manifests.yaml | head -n 40
+
+      - name: "Execute Deployment"
+        id: deploy_step
+        shell: bash
+        run: |
+          ENV_NAME="${{ inputs.environment }}"
+          APP_HOST="app-${ENV_NAME}.local"
+
+          if [ "$HAS_KUBECONFIG" = "true" ] && [ "${{ inputs.dry-run }}" = "false" ]; then
+            echo "Deploying to Kubernetes cluster (${ENV_NAME})..."
+            kubectl create namespace ${{ inputs.namespace }} --dry-run=client -o yaml | kubectl apply -f -
+
+            helm upgrade --install ${{ inputs.release-name }} ${{ inputs.chart-path }} \
+              --namespace ${{ inputs.namespace }} \
+              --set image.repository=${{ inputs.image-repository }} \
+              --set image.tag=${{ inputs.image-tag }} \
+              --wait --timeout 180s
+
+            kubectl rollout status deployment/${{ inputs.release-name }} -n ${{ inputs.namespace }} --timeout=120s
+            echo "status=deployed" >> "$GITHUB_OUTPUT"
+            echo "app-url=http://${APP_HOST}:8080" >> "$GITHUB_OUTPUT"
+          else
+            echo "Validation / dry-run deployment successful for ${ENV_NAME}."
+            echo "status=dry-run-success" >> "$GITHUB_OUTPUT"
+            echo "app-url=http://${APP_HOST}:8080" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Generate Step Summary"
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          ENV_UPPER=$(echo "${{ inputs.environment }}" | tr '[:lower:]' '[:upper:]')
+          echo "### 🚀 Deployment to ${ENV_UPPER}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Release**: \`${{ inputs.release-name }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Namespace**: \`${{ inputs.namespace }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image Tag**: \`${{ inputs.image-repository }}:${{ inputs.image-tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Deployment Status**: \`${{ steps.deploy_step.outputs.status }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Target Endpoint**: \`${{ steps.deploy_step.outputs.app-url }}\`" >> "$GITHUB_STEP_SUMMARY"

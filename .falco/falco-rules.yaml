@@ -1,0 +1,19 @@
+- rule: Terminal Shell in Production Container
+  desc: A shell was spawned by an untrusted binary or interactive session inside a container
+  condition: >
+    spawned_process and container
+    and proc.name in (bash, sh, zsh, dash, ksh)
+    and not proc.pname in (gunicorn, python)
+  output: "Interactive shell executed in container (user=%user.name container=%container.id command=%proc.cmdline)"
+  priority: WARNING
+  tags: [runtime, container, devsecops]
+
+- rule: Write to Non-Writable Directory in Hardened Container
+  desc: Attempt to write to read-only or system binaries directory
+  condition: >
+    open_write and container
+    and fd.name startswith /app
+    and not fd.name startswith /tmp
+  output: "File write attempt detected in hardened application directory (file=%fd.name user=%user.name container=%container.id)"
+  priority: ERROR
+  tags: [runtime, container, devsecops]

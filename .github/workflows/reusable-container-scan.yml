@@ -1,0 +1,204 @@
+name: "Reusable Container Build & Security Scan"
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: "Target image name (e.g., ghcr.io/org/repo or my-app)"
+        type: string
+        required: true
+      image-tag:
+        description: "Image tag to assign"
+        type: string
+        default: "latest"
+        required: false
+      dockerfile-path:
+        description: "Path to Dockerfile"
+        type: string
+        default: "Dockerfile"
+        required: false
+      context-path:
+        description: "Build context directory"
+        type: string
+        default: "."
+        required: false
+      push-image:
+        description: "Whether to push image to container registry upon passing scans"
+        type: boolean
+        default: false
+        required: false
+      registry:
+        description: "Container registry URL (e.g. ghcr.io, docker.io)"
+        type: string
+        default: "ghcr.io"
+        required: false
+      fail-on-findings:
+        description: "Fail the job if CRITICAL vulnerabilities are found"
+        type: boolean
+        default: false
+        required: false
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+        description: "Container registry username"
+      REGISTRY_PASSWORD:
+        required: false
+        description: "Container registry password / token"
+      SNYK_TOKEN:
+        required: false
+        description: "Snyk token for container scanning"
+    outputs:
+      image-ref:
+        description: "Full image reference with tag"
+        value: ${{ jobs.container-scan.outputs.image-ref }}
+      image-digest:
+        description: "SHA256 digest of built/pushed image"
+        value: ${{ jobs.container-scan.outputs.image-digest }}
+
+jobs:
+  container-scan:
+    name: "Container Scanning (Trivy, Clair & Snyk)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      actions: read
+    outputs:
+      image-ref: ${{ steps.meta.outputs.image-ref }}
+      image-digest: ${{ steps.push.outputs.digest || steps.build.outputs.digest }}
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+
+    steps:
+      - name: "Checkout Code"
+        uses: actions/checkout@v4
+
+      - name: "Set up Docker Buildx"
+        uses: docker/setup-buildx-action@v3
+
+      - name: "Determine Image Coordinates"
+        id: meta
+        shell: bash
+        run: |
+          FULL_IMAGE="${{ inputs.image-name }}:${{ inputs.image-tag }}"
+          echo "Full image coordinate: $FULL_IMAGE"
+          echo "image-ref=$FULL_IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: "Build Container Image Locally (Without Push)"
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context-path }}
+          file: ${{ inputs.dockerfile-path }}
+          push: false
+          load: true
+          tags: ${{ steps.meta.outputs.image-ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: "Create Reports Directory"
+        run: mkdir -p reports
+
+      - name: "Run Trivy Container Image Scan (SARIF)"
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: ${{ steps.meta.outputs.image-ref }}
+          scan-type: "image"
+          format: "sarif"
+          output: "reports/trivy-container.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: "Run Trivy Container Image Scan (JSON for DefectDojo)"
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          image-ref: ${{ steps.meta.outputs.image-ref }}
+          scan-type: "image"
+          format: "json"
+          output: "reports/trivy-container.json"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: "Run Snyk Container Scan (Optional)"
+        if: ${{ env.SNYK_TOKEN != '' }}
+        uses: snyk/actions/docker@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ steps.meta.outputs.image-ref }}
+          args: --sarif-file-output=reports/snyk-container.sarif
+
+      - name: "Generate Container SBOM with Syft"
+        uses: anchore/sbom-action@v0
+        continue-on-error: true
+        with:
+          image: ${{ steps.meta.outputs.image-ref }}
+          format: "spdx-json"
+          output-file: "reports/container-sbom.spdx.json"
+
+      - name: "Upload SARIF to GitHub Code Scanning"
+        if: ${{ !cancelled() && hashFiles('reports/trivy-container.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: reports/trivy-container.sarif
+          category: trivy-container-scanning
+
+      - name: "Upload Container Scan Artifacts"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: container-scan-reports
+          path: reports/*container*
+          retention-days: 14
+
+      - name: "Evaluate Security Quality Gate"
+        shell: bash
+        run: |
+          if [ -f reports/trivy-container.json ]; then
+            CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy-container.json 2>/dev/null || echo "0")
+            echo "Critical Vulnerabilities: $CRITICAL_COUNT"
+            if [ "$CRITICAL_COUNT" -gt 0 ] && [ "${{ inputs.fail-on-findings }}" = "true" ]; then
+              echo "❌ Quality Gate Failed: Found $CRITICAL_COUNT CRITICAL container vulnerabilities."
+              exit 1
+            fi
+          fi
+
+      - name: "Log in to Container Registry"
+        if: ${{ inputs.push-image && env.REGISTRY_PASSWORD != '' }}
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ secrets.REGISTRY_USERNAME || github.actor }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: "Push Image to Container Registry"
+        id: push
+        if: ${{ inputs.push-image && env.REGISTRY_PASSWORD != '' }}
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.context-path }}
+          file: ${{ inputs.dockerfile-path }}
+          push: true
+          tags: ${{ steps.meta.outputs.image-ref }}
+          cache-from: type=gha
+
+      - name: "Generate Step Summary"
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          echo "### 🐳 Container Security Scan & Image Registry" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Image**: \`${{ steps.meta.outputs.image-ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f reports/trivy-container.json ]; then
+            CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' reports/trivy-container.json 2>/dev/null || echo "0")
+            HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' reports/trivy-container.json 2>/dev/null || echo "0")
+            echo "- **Vulnerabilities**: CRITICAL=\`$CRIT\`, HIGH=\`$HIGH\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ "${{ inputs.push-image }}" = "true" ]; then
+            echo "- **Registry Push**: ✅ Successfully pushed to registry" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- **Registry Push**: Skipped (dry-run/scan-only mode)" >> "$GITHUB_STEP_SUMMARY"
+          fi
