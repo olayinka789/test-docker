@@ -1,0 +1,143 @@
+name: "Reusable SCA & SBOM Scanning"
+
+on:
+  workflow_call:
+    inputs:
+      scan-path:
+        description: "Path to application dependencies"
+        type: string
+        default: "."
+        required: false
+      enable-snyk:
+        description: "Enable Snyk vulnerability scan if token provided"
+        type: boolean
+        default: false
+        required: false
+      generate-sbom:
+        description: "Generate Software Bill of Materials (SBOM)"
+        type: boolean
+        default: true
+        required: false
+      fail-on-findings:
+        description: "Fail the job if HIGH or CRITICAL CVEs are found"
+        type: boolean
+        default: false
+        required: false
+    secrets:
+      SNYK_TOKEN:
+        required: false
+        description: "Snyk API Token"
+
+jobs:
+  sca:
+    name: "SCA & SBOM (Trivy, Pip-Audit & Snyk)"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+
+    steps:
+      - name: "Checkout Code"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: "Install Pip-Audit"
+        run: |
+          python -m pip install --upgrade pip
+          pip install pip-audit
+
+      - name: "Run Pip-Audit Dependency Scanner"
+        id: pip_audit
+        shell: bash
+        run: |
+          mkdir -p reports
+          EXIT_CODE=0
+          if [ -f "${{ inputs.scan-path }}/app/requirements.txt" ]; then
+            pip-audit -r "${{ inputs.scan-path }}/app/requirements.txt" -f json -o reports/pip-audit.json || EXIT_CODE=$?
+          elif [ -f "${{ inputs.scan-path }}/requirements.txt" ]; then
+            pip-audit -r "${{ inputs.scan-path }}/requirements.txt" -f json -o reports/pip-audit.json || EXIT_CODE=$?
+          else
+            echo "No requirements.txt found in target path. Scanning environment..."
+            pip-audit -f json -o reports/pip-audit.json || EXIT_CODE=$?
+          fi
+          echo "pip_audit_exit=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+
+      - name: "Run Trivy SCA (Filesystem & Dependencies)"
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          scan-type: "fs"
+          scan-ref: "${{ inputs.scan-path }}"
+          format: "sarif"
+          output: "reports/trivy-sca.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: "Run Trivy SCA (JSON for DefectDojo)"
+        uses: aquasecurity/trivy-action@master
+        continue-on-error: true
+        with:
+          scan-type: "fs"
+          scan-ref: "${{ inputs.scan-path }}"
+          format: "json"
+          output: "reports/trivy-sca.json"
+          severity: "CRITICAL,HIGH,MEDIUM"
+
+      - name: "Run Snyk Open Source Test (Optional)"
+        if: ${{ inputs.enable-snyk && secrets.SNYK_TOKEN != '' }}
+        uses: snyk/actions/python@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --sarif-file-output=reports/snyk-sca.sarif --json-file-output=reports/snyk-sca.json
+
+      - name: "Generate SBOM with Syft"
+        if: ${{ inputs.generate-sbom }}
+        uses: anchore/sbom-action@v0
+        with:
+          path: "${{ inputs.scan-path }}"
+          format: "spdx-json"
+          output-file: "reports/sbom.spdx.json"
+
+      - name: "Generate CycloneDX SBOM"
+        if: ${{ inputs.generate-sbom }}
+        uses: anchore/sbom-action@v0
+        with:
+          path: "${{ inputs.scan-path }}"
+          format: "cyclonedx-json"
+          output-file: "reports/sbom.cyclonedx.json"
+
+      - name: "Upload SARIF to GitHub Code Scanning"
+        if: ${{ !cancelled() && hashFiles('reports/trivy-sca.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: reports/trivy-sca.sarif
+          category: trivy-sca
+
+      - name: "Upload SCA & SBOM Artifacts"
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-reports
+          path: reports/*
+          retention-days: 14
+
+      - name: "Generate Step Summary"
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          echo "### 📦 SCA (Software Composition Analysis) & SBOM" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Scanners**: Trivy SCA, Pip-Audit, Snyk" >> "$GITHUB_STEP_SUMMARY"
+          if [ -f reports/sbom.spdx.json ]; then
+            echo "- **SBOM Generated**: \`SPDX JSON\` & \`CycloneDX JSON\`" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [ -f reports/trivy-sca.json ]; then
+            VULN_COUNT=$(jq '[.Results[]?.Vulnerabilities[]?] | length' reports/trivy-sca.json 2>/dev/null || echo "0")
+            echo "- **Dependency Vulnerabilities**: \`$VULN_COUNT\`" >> "$GITHUB_STEP_SUMMARY"
+          fi

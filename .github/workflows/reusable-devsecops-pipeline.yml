@@ -1,0 +1,321 @@
+name: "Unified DevSecOps Pipeline (WhatsApp Architecture)"
+
+on:
+  workflow_call:
+    inputs:
+      # Application CI Inputs
+      app-path:
+        description: "Path to application code"
+        type: string
+        default: "app"
+        required: false
+      image-name:
+        description: "Container image coordinate"
+        type: string
+        default: "ghcr.io/olayinka789/testapp"
+        required: false
+      image-tag:
+        description: "Container image tag"
+        type: string
+        default: "latest"
+        required: false
+      dockerfile-path:
+        description: "Path to Dockerfile"
+        type: string
+        default: "Dockerfile"
+        required: false
+      push-image:
+        description: "Push built container image to registry"
+        type: boolean
+        default: false
+        required: false
+
+      # Infrastructure CI Inputs
+      iac-path:
+        description: "Path to Infrastructure as Code directory"
+        type: string
+        default: "helmchart"
+        required: false
+      helm-release-name:
+        description: "Name of Helm release"
+        type: string
+        default: "testapp"
+        required: false
+
+      # CD & DAST Inputs
+      staging-url:
+        description: "URL of staging environment for DAST scanning"
+        type: string
+        default: "https://staging.wonderfulmeadow-71aa9bab.ukwest.azurecontainerapps.io"
+        required: false
+      deploy-to-staging:
+        description: "Enable automated deployment to staging"
+        type: boolean
+        default: true
+        required: false
+      deploy-to-prod:
+        description: "Enable deployment to production"
+        type: boolean
+        default: true
+        required: false
+
+      # Vulnerability Management Inputs
+      defectdojo-url:
+        description: "DefectDojo Server URL"
+        type: string
+        default: ""
+        required: false
+      archery-url:
+        description: "ArcherySec Server URL"
+        type: string
+        default: ""
+        required: false
+
+      # Security Quality Gate
+      fail-on-findings:
+        description: "Enforce blocking quality gate on security findings"
+        type: boolean
+        default: false
+        required: false
+
+    secrets:
+      REGISTRY_USERNAME:
+        required: false
+      REGISTRY_PASSWORD:
+        required: false
+      SONAR_TOKEN:
+        required: false
+      SONAR_HOST_URL:
+        required: false
+      SNYK_TOKEN:
+        required: false
+      DEFECTDOJO_API_KEY:
+        required: false
+      ARCHERY_API_KEY:
+        required: false
+      KUBECONFIG_DATA:
+        required: false
+      NESSUS_API_KEY:
+        required: false
+
+jobs:
+  # =========================================================================
+  # 1. PIPELINE INITIALIZATION
+  # =========================================================================
+  pipeline-init:
+    name: "Pipeline Init (AppCode & InfraCode)"
+    runs-on: ubuntu-latest
+    outputs:
+      git-sha: ${{ steps.init.outputs.sha }}
+      build-time: ${{ steps.init.outputs.time }}
+    steps:
+      - name: "Checkout Codebase"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: "Initialize Environment"
+        id: init
+        run: |
+          echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "time=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+          echo "DevSecOps Pipeline initialized for commit $(git rev-parse --short HEAD)"
+
+  # =========================================================================
+  # 2. GIT APPCODE CI TRACK
+  # =========================================================================
+  app-secret-scanning:
+    name: "App: Secret Scanning"
+    needs: [pipeline-init]
+    uses: ./.github/workflows/reusable-secret-scan.yml
+    with:
+      scan-path: "."
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+      upload-sarif: true
+
+  app-sast:
+    name: "App: SAST"
+    needs: [pipeline-init]
+    uses: ./.github/workflows/reusable-sast.yml
+    with:
+      scan-path: "."
+      semgrep-rules: "p/default p/security-audit p/owasp-top-ten"
+      enable-sonar: false
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+
+  app-sca:
+    name: "App: SCA & SBOM"
+    needs: [pipeline-init]
+    uses: ./.github/workflows/reusable-sca.yml
+    with:
+      scan-path: "."
+      generate-sbom: true
+      enable-snyk: false
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  app-container-scanning:
+    name: "App: Container Scanning & Registry"
+    needs: [pipeline-init]
+    uses: ./.github/workflows/reusable-container-scan.yml
+    with:
+      image-name: ${{ inputs.image-name }}
+      image-tag: ${{ inputs.image-tag }}
+      dockerfile-path: ${{ inputs.dockerfile-path }}
+      context-path: "."
+      push-image: ${{ inputs.push-image }}
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+    secrets:
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # =========================================================================
+  # 3. GIT INFRACODE CI TRACK
+  # =========================================================================
+  infra-secret-scanning:
+    name: "Infra: Secret Scanning"
+    needs: [pipeline-init]
+    uses: ./.github/workflows/reusable-secret-scan.yml
+    with:
+      scan-path: ${{ inputs.iac-path }}
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+      upload-sarif: false
+
+  infra-iac-scanning:
+    name: "Infra: IaC Scanning (Checkov & Terrascan)"
+    needs: [pipeline-init]
+    uses: ./.github/workflows/reusable-iac-scan.yml
+    with:
+      iac-path: ${{ inputs.iac-path }}
+      framework: "helm,kubernetes,dockerfile"
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # =========================================================================
+  # 4. CENTRAL VULNERABILITY MANAGEMENT (HUB)
+  # =========================================================================
+  central-vuln-management-ci:
+    name: "Central Vulnerability Management (CI Aggregation)"
+    needs:
+      - app-secret-scanning
+      - app-sast
+      - app-sca
+      - app-container-scanning
+      - infra-secret-scanning
+      - infra-iac-scanning
+    if: always()
+    uses: ./.github/workflows/reusable-central-vuln-mgmt.yml
+    with:
+      defectdojo-url: ${{ inputs.defectdojo-url }}
+      archery-url: ${{ inputs.archery-url }}
+      product-name: "Kind-DevSecOps-Suite"
+      engagement-name: "CI Scan Gate"
+    secrets:
+      DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+      ARCHERY_API_KEY: ${{ secrets.ARCHERY_API_KEY }}
+
+  # =========================================================================
+  # 5. CD TRACK: STAGING DEPLOYMENT
+  # =========================================================================
+  deploy-staging:
+    name: "CD: Deploy - Staging"
+    needs:
+      - app-container-scanning
+      - infra-iac-scanning
+      - central-vuln-management-ci
+    if: ${{ inputs.deploy-to-staging && !cancelled() }}
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: "staging"
+      chart-path: ${{ inputs.iac-path }}
+      release-name: ${{ inputs.helm-release-name }}
+      namespace: "staging"
+      image-repository: ${{ inputs.image-name }}
+      image-tag: ${{ inputs.image-tag }}
+    secrets:
+      KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+
+  # =========================================================================
+  # 6. DAST SCANNING (AGAINST STAGING)
+  # =========================================================================
+  dast-staging:
+    name: "DAST: OWASP ZAP (Staging)"
+    needs: [deploy-staging]
+    uses: ./.github/workflows/reusable-dast.yml
+    with:
+      target-url: ${{ inputs.staging-url }}
+      scan-type: "baseline"
+      fail-on-findings: ${{ inputs.fail-on-findings }}
+
+  # =========================================================================
+  # 7. INFRASTRUCTURE SCANNING (STAGING)
+  # =========================================================================
+  infra-scanning-staging:
+    name: "Infra Scanning: Nuclei / Nessus (Staging)"
+    needs: [deploy-staging]
+    uses: ./.github/workflows/reusable-runtime-infra.yml
+    with:
+      target-infra: "localhost"
+      environment: "staging"
+    secrets:
+      NESSUS_API_KEY: ${{ secrets.NESSUS_API_KEY }}
+
+  # =========================================================================
+  # 8. CENTRAL VULNERABILITY MANAGEMENT (CD AGGREGATION)
+  # =========================================================================
+  central-vuln-management-cd:
+    name: "Central Vulnerability Management (CD Ingestion)"
+    needs:
+      - dast-staging
+      - infra-scanning-staging
+    if: always()
+    uses: ./.github/workflows/reusable-central-vuln-mgmt.yml
+    with:
+      defectdojo-url: ${{ inputs.defectdojo-url }}
+      archery-url: ${{ inputs.archery-url }}
+      product-name: "Kind-DevSecOps-Suite"
+      engagement-name: "CD & DAST Staging Gate"
+    secrets:
+      DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+      ARCHERY_API_KEY: ${{ secrets.ARCHERY_API_KEY }}
+
+  # =========================================================================
+  # 9. CD TRACK: PRODUCTION DEPLOYMENT
+  # =========================================================================
+  deploy-prod:
+    name: "CD: Deploy - Prod"
+    needs:
+      - deploy-staging
+      - dast-staging
+      - central-vuln-management-cd
+    if: ${{ inputs.deploy-to-prod && !cancelled() }}
+    uses: ./.github/workflows/reusable-deploy.yml
+    with:
+      environment: "prod"
+      chart-path: ${{ inputs.iac-path }}
+      release-name: ${{ inputs.helm-release-name }}
+      namespace: "production"
+      image-repository: ${{ inputs.image-name }}
+      image-tag: ${{ inputs.image-tag }}
+    secrets:
+      KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+
+  # =========================================================================
+  # 10. RUNTIME CARE & CONTINUOUS SCANNING (PROD)
+  # =========================================================================
+  runtime-care-prod:
+    name: "Prod: Falco Runtime Care & Continuous Scanning"
+    needs: [deploy-prod]
+    uses: ./.github/workflows/reusable-runtime-infra.yml
+    with:
+      target-infra: "production.cluster.local"
+      environment: "prod"
+      rules-path: ".falco/falco-rules.yaml"
+    secrets:
+      NESSUS_API_KEY: ${{ secrets.NESSUS_API_KEY }}

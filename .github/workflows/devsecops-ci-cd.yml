@@ -1,0 +1,56 @@
+name: "DevSecOps CI/CD Pipeline"
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      deploy-to-staging:
+        description: "Deploy to Staging environment"
+        type: boolean
+        default: true
+      deploy-to-prod:
+        description: "Deploy to Production environment"
+        type: boolean
+        default: false
+      fail-on-findings:
+        description: "Block pipeline on security violations"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+  security-events: write
+  actions: read
+
+jobs:
+  devsecops-orchestrator:
+    name: "DevSecOps Master Pipeline"
+    uses: ./.github/workflows/reusable-devsecops-pipeline.yml
+    with:
+      app-path: "app"
+      image-name: "ghcr.io/${{ github.repository }}"
+      image-tag: ${{ github.sha }}
+      dockerfile-path: "Dockerfile"
+      push-image: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+      iac-path: "helmchart"
+      helm-release-name: "testapp"
+      staging-url: "https://staging.wonderfulmeadow-71aa9bab.ukwest.azurecontainerapps.io"
+      deploy-to-staging: ${{ github.event.inputs.deploy-to-staging != 'false' }}
+      deploy-to-prod: ${{ github.event.inputs.deploy-to-prod == 'true' }}
+      fail-on-findings: ${{ github.event.inputs.fail-on-findings == 'true' }}
+      defectdojo-url: ""
+      archery-url: ""
+    secrets:
+      REGISTRY_USERNAME: ${{ github.actor }}
+      REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      DEFECTDOJO_API_KEY: ${{ secrets.DEFECTDOJO_API_KEY }}
+      ARCHERY_API_KEY: ${{ secrets.ARCHERY_API_KEY }}
+      KUBECONFIG_DATA: ${{ secrets.KUBECONFIG_DATA }}
+      NESSUS_API_KEY: ${{ secrets.NESSUS_API_KEY }}
