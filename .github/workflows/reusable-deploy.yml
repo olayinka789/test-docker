@@ -128,7 +128,8 @@ jobs:
         if: ${{ !cancelled() }}
         shell: bash
         run: |
-          echo "### 🚀 Deployment to ${{ inputs.environment | uppercase }}" >> "$GITHUB_STEP_SUMMARY"
+          ENV_UPPER=$(echo "${{ inputs.environment }}" | tr '[:lower:]' '[:upper:]')
+          echo "### 🚀 Deployment to ${ENV_UPPER}" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Release**: \`${{ inputs.release-name }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Namespace**: \`${{ inputs.namespace }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- **Image Tag**: \`${{ inputs.image-repository }}:${{ inputs.image-tag }}\`" >> "$GITHUB_STEP_SUMMARY"

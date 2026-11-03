@@ -36,6 +36,8 @@ jobs:
       contents: read
       security-events: write
       actions: read
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
       - name: "Checkout Code"
@@ -88,7 +90,7 @@ jobs:
           severity: "CRITICAL,HIGH,MEDIUM"
 
       - name: "Run Snyk Open Source Test (Optional)"
-        if: ${{ inputs.enable-snyk && secrets.SNYK_TOKEN != '' }}
+        if: ${{ inputs.enable-snyk && env.SNYK_TOKEN != '' }}
         uses: snyk/actions/python@master
         continue-on-error: true
         env:

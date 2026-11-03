@@ -39,6 +39,9 @@ jobs:
       contents: read
       security-events: write
       actions: read
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
 
     steps:
       - name: "Checkout Code"
@@ -84,7 +87,7 @@ jobs:
           fi
 
       - name: "Run SonarQube / SonarCloud Scanner (Optional)"
-        if: ${{ inputs.enable-sonar && secrets.SONAR_TOKEN != '' }}
+        if: ${{ inputs.enable-sonar && env.SONAR_TOKEN != '' }}
         uses: SonarSource/sonarqube-scan-action@v4
         continue-on-error: true
         env:

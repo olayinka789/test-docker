@@ -31,6 +31,8 @@ jobs:
       contents: read
       security-events: write
       actions: read
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
 
     steps:
       - name: "Checkout Code"
@@ -90,7 +92,7 @@ jobs:
           severity: "CRITICAL,HIGH,MEDIUM"
 
       - name: "Run Snyk IaC Test (Optional)"
-        if: ${{ secrets.SNYK_TOKEN != '' }}
+        if: ${{ env.SNYK_TOKEN != '' }}
         uses: snyk/actions/iac@master
         continue-on-error: true
         env:
